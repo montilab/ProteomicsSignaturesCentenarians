@@ -1,0 +1,252 @@
+---
+title: "Somascan GeneSet Projection Analysis"
+author: "Stefano Monti, Paola Sebastiani, Anastasia Gurinovich"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    theme: united
+    toc: yes
+---
+
+```{r global, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE,fig.path='../results/somascan/figures/')
+```
+
+```{r settings}
+require(CBMRtools)
+require(limma)
+require(pheatmap)
+require(openxlsx)
+require(GSVA)
+PATH <- "~/research/projects/longevity"
+source(file.path(PATH,"scripts/support.functions.R"))
+source(file.path(Sys.getenv("CBMRtools"),"dvlp/diffanalOverlap.R"))
+overwrite <- FALSE
+```
+
+## GeneSet Projection
+
+We next project the data onto the space of the <a
+href="http://software.broadinstitute.org/gsea/msigdb/collections.jsp#C2">`C2.CP`</a>
+and the <a
+href="http://software.broadinstitute.org/gsea/msigdb/collections.jsp#h.all">`hallmarks`</a>
+geneset compendia.
+
+```{r data.preprocess}
+## Load the necessary data. Since GSVA doesn't handle missing data, we
+## take the unthresholded versions of the data
+soma0 <- readRDS(file.path(PATH,"workdir/somascan/soma0.RDS")) # unthresholded data (hence, w/o NA's)
+soma2 <- readRDS(file.path(PATH,"workdir/somascan/soma2.RDS")) # thresholded data w/ simplified pData
+if ( !all.equal(dimnames(soma0),dimnames(soma2)) ) stop( "dimnames(soma0)!=dimnames(soma2)" )
+
+soma3.file <- file.path(PATH,"workdir/somascan/soma3.RDS")
+soma3 <- {
+    if ( file.exists(soma3.file) && !overwrite ) {
+        readRDS(soma3.file)
+    }
+    else {
+        soma3 <- soma0                # use the data w/o thresholding
+        pData(soma3) <- pData(soma2)  # ..but use the simplified annotation
+                                      # annotate rows w/ gene symbols (for gsva)
+        fData(soma3)$orig.symbol <- toupper(fData(soma3)$orig.symbol)
+        soma3 <- collapse2genesymbol(eset=soma3, colId="orig.symbol", method='max')
+        ## fData(soma3)$symbol <- toupper(fData(soma3)$symbol)
+        ## soma3 <- collapse2genesymbol(eset=soma3, colId="symbol", method='max')
+        saveRDS(soma3,file=soma3.file)
+        soma3
+    }
+}
+## load pheatmap annotation from 'analysis01.somascan.Rmd'
+tmp <- readRDS(file.path(PATH,"workdir/somascan/pheatmap.annot.RDS"))
+annot <- tmp$annot
+annotCol <- tmp$annotCol
+annot <- annot[sampleNames(soma3),]
+
+## keep only centenarian annotation plus 'longevity follow-up' (see
+## .. Longevity Grouping in analaysis01.somascan.Rmd)
+annot <- annot[,"group",drop=FALSE]
+annot$FU.2group <- soma3$FU.2group
+annotCol <- c(annotCol,list(FU.2group=c(short="pink",long="green")))
+
+## modification on 3/2/2019 (remove fu group, and group into centenarian, offspring, control)
+annot <- annot[,"group",drop=FALSE]
+grp <- as.character(annot[,"group"])
+grp[grep("Offspring",grp)] <- "offspring"
+grp[grep("Control",grp)] <- "control"
+grp[grep("Centenarian",grp)] <- "centenarian"
+annot[,"group"] <- factor(grp)
+annotCol$group <- c(centenarian="red",offspring="pink",control="antiquewhite")
+```
+
+Since there are only `r nrow(soma3)` unique mapped genes represented
+in the Somascan assay, we reduce the genesets' size accordingly, by
+taking the overlap of each original geneset with the Somascan genes,
+and by further eliminating the genesets with less than 5 members
+(`preprocess.geneset` is defined in the file `support.functions.R`).
+
+```{r gsp.preprocess.gsets}
+c2cp <- preprocess.gsets(gsetsFile="~/researchData/annot/c2.cp.v6.1.symbols.gmt",
+                         bkg=featureNames(soma3), minGset=5, do.unique=FALSE )
+hall <- preprocess.gsets(gsetsFile="~/researchData/annot/h.all.v6.1.symbols.gmt",
+                         bkg=featureNames(soma3), minGset=5, do.unique=FALSE )
+```
+
+We thus reduced the final list of C2.CP genesets to `r length(c2cp)`
+sets, while all hallmarks 'survive' the filtering.
+
+On these lists, we run <a
+href="https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-14-7">`GSVA`</a>,
+wich computes a sample-specific geneset enrichment score (between -1.0
+and 1.0) for each of the provided genesets, and generates a
+corresponding geneset-by-sample matrix.
+
+### C2.CP projection
+
+```{r gsva.c2cp}
+#soma3 <- readRDS(file.path(PATH,"workdir/somascan/soma3.RDS"))
+somaC2cp.file <- file.path(PATH,"workdir/somascan/somaC2cp.RDS")
+if ( file.exists(somaC2cp.file) && !overwrite ) {
+    somaC2cp <- readRDS(somaC2cp.file)
+}
+if ( !file.exists(somaC2cp.file) || overwrite ) {
+    somaC2cp <- gsva(soma3, c2cp, mx.diff=FALSE, verbose=FALSE, parallel.sz=1)$es.obs
+    saveRDS(somaC2cp,file=somaC2cp.file)
+}
+featureNames(somaC2cp) <- gsub("KEGG_","K_",featureNames(somaC2cp))
+featureNames(somaC2cp) <- gsub("REACTOME_","R_",featureNames(somaC2cp))
+featureNames(somaC2cp) <- gsub("PID_","P_",featureNames(somaC2cp))
+featureNames(somaC2cp) <- gsub("BIOCARTA_","B_",featureNames(somaC2cp))
+
+hcRow <- hcopt(dist(exprs(somaC2cp)),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(somaC2cp))),method="ward.D")
+pheatmap(exprs(somaC2cp),
+         color=colGradient(c("blue","white","red"),length=15),
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         fontsize_row=2,
+         labels_row=sapply(featureNames(somaC2cp),substr,1,20),
+         scale = "none")
+write.xlsx(exprs(somaC2cp)[rev(hcRow$order),rev(hcCol$order)],rowNames=TRUE,
+           file=file.path(PATH,"results/somascan/somaC2cp.xlsx"))
+```
+The GSVA-projected data in excel format (and sorted according to
+clustering) is stored in <a
+href="somascan/somaC2cp.xlsx">`results/somascan/somaC2cp.xlsx`</a>.
+
+### Hallmarks projection
+
+Let's repeat by using the <a
+href="http://software.broadinstitute.org/gsea/msigdb/collections.jsp#h.all">`hallmarks`
+compendium</a>.
+
+```{r gsva.hallmarks}
+somaHall.file <- file.path(PATH,"workdir/somascan/somaHall.RDS")
+if ( file.exists(somaHall.file) && !overwrite ) {
+    somaHall <- readRDS(somaHall.file)
+}
+if ( !file.exists(somaHall.file) || overwrite ) {
+    somaHall <- gsva(soma3, hall, mx.diff=FALSE, verbose=FALSE, parallel.sz=1)$es.obs
+    saveRDS(somaHall,file=somaHall.file)
+}
+featureNames(somaHall) <- gsub("HALLMARK_","",featureNames(somaHall))
+
+hcRow <- hcopt(dist(exprs(somaHall)),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(somaHall))),method="ward.D")
+pheatmap(exprs(somaHall),
+         color=colGradient(c("blue","white","red"),length=15),
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         fontsize_row=5,
+         labels_row=sapply(featureNames(somaHall),substr,1,20),
+         scale = "none")
+write.xlsx(exprs(somaHall)[rev(hcRow$order),rev(hcCol$order)],rowNames=TRUE,
+           file=file.path(PATH,"results/somascan/somaHall.xlsx"))
+```
+
+The GSVA-projected data in excel format (and sorted according to
+clustering) is stored in <a
+href="somascan/somaHall.xlsx">`results/somascan/somaHall.xlsx`</a>.
+
+## Differential Pathway Analysis
+
+We now perform differential analysis in the space of geneset
+projection scores, both for C2.CP and hallmarks.
+
+```{r diffanal.gsp.c2}
+## defining a function for repeated tasks (in scripts/support.functions.R)
+print(gsets.diffanal)
+
+## perform diffanal based on C2.CP
+lmC2cp <- gsets.diffanal(gspDat.file=file.path(PATH,"workdir/somascan/somaC2cp.RDS"),
+                         do.heatmap=TRUE, annot=annot, annotCol=annotCol, fontsize_row=3)
+
+## ..and on Hallmarks
+lmHall <- gsets.diffanal(gspDat.file=file.path(PATH,"workdir/somascan/somaHall.RDS"),max.fdr=0.05,
+                         do.heatmap=TRUE, annot=annot, annotCol=annotCol,fontsize_row=6)
+```
+
+## APOE QTL
+
+```{r apoe.qtl.support.functions, echo=FALSE}
+eQTL.simple.fun <- function( eset )
+{
+    eQTL <- data.frame(t(apply( exprs(eset), 1, function(Y) {
+        fit <- lm(Y ~ eset$apoe)
+        anv <- anova(fit)
+        c( fit$coefficients[c("eset$apoeE2","eset$apoeE4")],unlist(anv[1,c("F value","Pr(>F)")]) )
+    })),check.names=FALSE)
+    colnames(eQTL) <- gsub("eset\\$","",colnames(eQTL))
+#    eQTL <- cbind(eQTL,symbol=fData(eset)[,"hgnc_symbol"])
+    eQTL <- eQTL[,c("symbol","apoeE2","apoeE4","F value","Pr(>F)")]
+    eQTL$fdr <- p.adjust(eQTL[,"Pr(>F)"],method="BH")
+    eQTL
+}
+eQTL.fun <- function( eset )
+{
+    eQTL <- data.frame(t(apply( exprs(eset), 1, function(Y) {
+        fit2 <- lm(Y ~ eset$Cohort + eset$apoe)
+        fit1 <- lm(Y ~ eset$Cohort)
+        av12 <- anova(fit1,fit2)
+        c( fit2$coefficients[c("eset$apoeE2","eset$apoeE4")],unlist(av12[2,c("F","Pr(>F)")]) )
+    })),check.names=FALSE)
+    colnames(eQTL) <- gsub("eset\\$","",colnames(eQTL))
+#    eQTL <- cbind(eQTL,symbol=fData(eset)[,"hgnc_symbol"])
+    eQTL <- eQTL[,c("apoeE2","apoeE4","F","Pr(>F)")]
+    eQTL$fdr <- p.adjust(eQTL[,"Pr(>F)"],method="BH")
+    eQTL
+}
+```
+
+```{r apoe.eqtl}
+somaC2cp <- readRDS(file=file.path(PATH,"workdir/somascan/somaC2cp.RDS"))
+somaHall <- readRDS(file=file.path(PATH,"workdir/somascan/somaHall.RDS"))
+apoe <- factor(rep("NA",ncol(somaHall)),levels=c("E3","E2","E4"))
+apoe[somaC2cp$APOE %in% c("e2e2","e2e3")] <- "E2"
+apoe[somaC2cp$APOE %in% c("e3e3")] <- "E3"
+apoe[somaC2cp$APOE %in% c("e3e4")] <- "E4"
+table(apoe,useNA="ifany")
+
+if ( !all.equal(pData(somaC2cp),pData(somaHall)) ) stop( "pData(somaC2cp) != pData(somaHall)" )
+somaC2cp$apoe <- somaHall$apoe <- apoe
+somaC2cp1 <- somaC2cp[,!is.na(somaC2cp$apoe)]
+somaHall1 <- somaHall[,!is.na(somaHall$apoe)]
+
+eQTL.hall <- eQTL.fun( eset=somaHall1 )
+eQTL.hall.ord <- eQTL.hall[order(eQTL.hall[,"fdr"],decreasing=FALSE),]
+eQTL.c2cp <- eQTL.fun( eset=somaC2cp1 )
+eQTL.c2cp.ord <- eQTL.c2cp[order(eQTL.c2cp[,"fdr"],decreasing=FALSE),]
+
+saveRDS(eQTL.hall,file=file.path(PATH,"workdir/somascan/eQTL.hall.RDS"))
+saveRDS(eQTL.c2cp,file=file.path(PATH,"workdir/somascan/eQTL.c2cp.RDS"))
+write.xlsx(list(hallmarks=eQTL.hall.ord,c2cp=eQTL.c2cp.ord),rowNames=TRUE,
+           file=file.path(PATH,"results/somascan/apoe.eQTL.GSVA.xlsx"))
+```
