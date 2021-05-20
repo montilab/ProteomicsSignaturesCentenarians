@@ -1,0 +1,1181 @@
+---
+title: "Analyses for Longevity Manuscript"
+author: "Stefano Monti"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: yes
+    toc_float: no
+---
+
+```{r global, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE,fig.path='../results/manuscript/figures/')
+```
+
+```{r settings}
+require(Biobase)
+require(CBMRtools)
+require(pheatmap)
+require(openxlsx)
+require(GSVA)
+require(Biobase)
+require(limma)
+require(hypeR)
+PATH <- file.path( Sys.getenv("HOME"), "research/projects/longevity/novartis" )
+source(file.path(PATH,"scripts/support.functions.R"))
+source(file.path(Sys.getenv("CBMRtools"),"dvlp/diffanalOverlap.R"))
+source(file.path(Sys.getenv("CBMRtools"),"CBMRtools/R/ggheat.continuous.R"))
+interactive <- FALSE
+saveFigures <- FALSE
+
+gheatmapColors <- colGradient(c("blue","white","red"),length=11)
+pheatmapColors <- colGradient(c("darkgreen","white","darkorange"),length=11)
+```
+
+## PCA & Outlier Identification
+
+```{r load.raw}
+soma <- readRDS(file.path(PATH,"data/somascan/180308_CentCollabBU_HybNormPlateScaleMedNormCal.eset.RDS"))
+somaL <- soma; exprs(somaL) <- log2(exprs(soma))
+
+cohort <- as.character(pData(somaL)$Cohort)
+cohort[grep("Control",cohort)] <- "Control"
+cohort <- gsub("Centenarian Offspring","Offspring",cohort)
+cohort <- gsub("Centenarian Singleton","Centenarian",cohort)
+cohort <- gsub("Centenarian Sib-Pair","Centenarian",cohort)
+somaL$Cohort <- factor(cohort,levels=c("Control","Offspring","Centenarian"))
+
+## color-codes for samples and markers
+cohortPalette <- c("lightgray","pink","red")
+names(cohortPalette) <- levels(somaL$Cohort)
+cohortCol <- cohortPalette[somaL$Cohort]
+names(cohortCol) <- sampleNames(somaL)
+```
+
+### Principal Component Analysis 
+```{r pca}
+pca <- prcomp(exprs(somaL), scale = TRUE) ## perform PCA
+summary(pca)$importance[,1:4]             ## show variance explained by each component
+
+## let's plot the first two components
+mag <- 2
+par(mar=c(5, 5, 4, 2) + 0.1)
+if ( any(rownames(pca$rotation)!=names(cohortCol)) ) stop( "rownames(pca$rotation)!=names(cohortCol)" )
+plot(x=pca$rotation[,"PC1"],y=pca$rotation[,"PC2"],col=cohortCol,main="PCA",xlab="1st PC", ylab="2nd PC",
+     pch=20,cex.axis=mag,cex.lab=mag,cex.main=mag)
+legend("bottomleft",col=cohortPalette,legend=names(cohortPalette),pch=20)
+
+outliers <- which(pca$rotation[,"PC1"]<.060)
+text(x=pca$rotation[outliers,"PC1"],y=pca$rotation[outliers,"PC2"],pos=4,
+     labels=gsub("S-161024-","",rownames(pca$rotation)[outliers]))
+```
+
+### Samples' Distributions
+```{r boxplots}
+ord <- order(pData(somaL)$Cohort)
+outlier.names <- sampleNames(soma); outlier.names[-outliers] <- ""
+outlier.border <- rep("gray",ncol(soma)); outlier.border[outliers] <- "black"
+par(mar=c(7, 4, 4, 2))
+boxplot(exprs(somaL)[,ord],las=2,pch="-",col=cohortCol[ord],names=outlier.names[ord],
+        border=outlier.border[ord],cex.axis=.75)
+legend("bottomleft",col=cohortPalette,legend=names(cohortPalette),pch=15,cex=.7)
+
+remove <- sampleNames(soma)[order(pca$rotation[,"PC1"])[1:2]]
+soma0 <- somaL[,-match(remove,sampleNames(somaL))]
+print(remove)
+```
+
+### Distribution of Samples' Medians
+```{r median.outliers, height=3,width=1}
+MEDs <- data.frame(median=apply( exprs(somaL), 2, median ),group=1)
+p <- ggplot(data=MEDs, aes(x=group,y=median,outlier.color="gray")) + 
+  geom_boxplot() + 
+  geom_point(data=MEDs[remove,,drop=FALSE],aes(x=group,y=median,col="red"),size=3) + 
+  geom_text(data=MEDs,aes(label=outlier.names),nudge_y=0.05) +
+  theme(plot.margin=margin(1,5,1,5, "cm"),
+        axis.ticks.x=element_blank(),
+        axis.text.x=element_blank())
+p
+```
+
+## Aging Signature
+
+We first derive and annotate the aging signature, that is the
+signature of "centenarians vs. non-centenarians", where the latter
+group is defined as the combination of offsprings and controls.
+
+### Analyte-Based Diffanal
+
+```{r aging.diffanal}
+## see analysis01.somascan.Rmd for derivation of soma2
+soma2 <- readRDS(file.path(PATH,"workdir/somascan/soma2.RDS"))
+print(c(analytes=length(unique(fData(soma2)$tag)),
+        proteins=length(unique(fData(soma2)$symbol)),
+        orig.symbol=length(unique(fData(soma2)$orig.symbol))))
+table(soma2$Cohort)
+
+## diffanal: simple linear model
+lmRes <-
+    as.data.frame(
+        t(sapply( 1:nrow(soma2),
+                 function(i) {
+                     tmp <- lm(exprs(soma2)[i,] ~ Cohort + Gender + Year.completed, data=pData(soma2))
+                     summary(tmp)$coefficients["CohortCentenarian",c("Estimate","Pr(>|t|)")]
+                 }))
+    )
+rownames(lmRes) <- featureNames(soma2)
+lmRes <- cbind(geneID=fData(soma2)$symbol,lmRes)
+lmRes <- lmRes[order(lmRes[,"Pr(>|t|)"]),]
+lmRes$fdr <- p.adjust(lmRes[,"Pr(>|t|)"], method="BH")
+tmp <- fast.mean(exprs(soma2),cls=soma2$Cohort,na.rm=TRUE)
+lmRes <- cbind(lmRes,tmp[rownames(lmRes),])
+
+##lmRes <- readRDS(file=file.path(PATH,"workdir/somascan/lmRes.RDS"))
+
+## number of analytes
+print( rbind(analytes=c("fdr<=0.05"=sum(lmRes$fdr<=.05), "fdr<=0.01"=sum(lmRes$fdr<=.01)),
+             proteins=c("fdr<=0.05"=length(unique(lmRes$geneID[lmRes$fdr<=.05])),
+                        "fdr<=0.01"=length(unique(lmRes$geneID[lmRes$fdr<=.01])))) )
+
+saveRDS(lmRes,file=file.path(PATH,"workdir/somascan/lmRes.RDS"))
+write.xlsx(lmRes,file=file.path(PATH,"results/manuscript/lmRes.xlsx"),row.names=TRUE)
+```
+
+### Analyte-Based Heatmaps
+
+```{r heatmap.colors}
+## color gradient for the expression levels (blue=down-regulated; white=neutral; red=up-regulated)
+bwrPalette <- colGradient(c("blue","white","red"),length=9)
+
+## color-codes for samples and markers
+cohortPalette <- c("lightgray","pink","red")
+names(cohortPalette) <- levels(pData(soma2)[,"Cohort"])
+cohortCol <- cohortPalette[pData(soma2)[,"Cohort"]]
+names(cohortCol) <- sampleNames(soma2) 
+
+annot_col <- pData(soma2)[, c("Cohort"),drop=FALSE]
+colnames(annot_col ) <- c("group")
+
+annot_row <- data.frame(markers=c("down","up")[as.integer(lmRes$Estimate>0)+1])
+rownames(annot_row) <- rownames(lmRes)
+
+annotColors <- list(
+    group = cohortPalette,
+    markers = c(down="darkgreen",up="darkred")
+)
+```
+
+```{r aging.heatmap, fig.height=11, fig.width=8}
+max.fdr <- 0.01
+## extract and order the top differential markers (in both directions)
+lmRes01 <- lmRes[lmRes$fdr<max.fdr,]; lmRes01 <- lmRes01[order(lmRes01$Estimate,decreasing=TRUE),]
+somaLM <- soma2[rownames(lmRes01),]
+
+## with rows sorted by differential score, columns clustered *within* groups
+if ( saveFigures ) png(file.path(PATH,"results/manuscript/png/aging.heatmap01.png"),width=900,height=1200)
+pheatmap.group(somaLM, main="samples clustered within phenotype, markers sorted",
+               group="Cohort",
+               color=gheatmapColors, 
+               annotation_col = annot_col,
+               annotation_row = annot_row[featureNames(somaLM),,drop=FALSE],
+               annotation_colors = annotColors,
+               show_rownames = FALSE,
+               show_colnames = FALSE,
+               cluster_rows = FALSE,
+               scale = "row")
+if ( saveFigures ) dev.off()
+
+## with rows sorted by clustering, columns clustered *within* groups
+if ( saveFigures ) png(file.path(PATH,"results/manuscript/png/aging.heatmap02.png"),width=900,height=1200)
+pheatmap.group(somaLM, main="samples clustered within phenotype, markers clustered",
+               group="Cohort", 
+               color=gheatmapColors,
+               annotation_col = annot_col,
+               annotation_row = annot_row[featureNames(somaLM),,drop=FALSE],
+               annotation_colors = annotColors,
+               show_rownames = FALSE,
+               show_colnames = FALSE,
+               scale = "row")
+if ( saveFigures ) dev.off()
+    
+## with rows sorted by differential score, columns sorted by groups
+if ( saveFigures ) png(file.path(PATH,"results/manuscript/png/aging.heatmap03.png"),width=900,height=1200)
+pheatmap(exprs(somaLM)[,order(somaLM$Cohort)],
+         main="samples and markers sorted",
+         color=gheatmapColors,
+         annotation_col = annot_col,
+         annotation_row = annot_row[featureNames(somaLM),,drop=FALSE],
+         annotation_colors = annotColors,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         scale = "row")
+if ( saveFigures ) dev.off()
+
+## selecting only top n markers/direction
+max.genes <- 40
+up <- lmRes[lmRes$Estimate>0 & lmRes$fdr<=max.fdr ,]
+up <- up[order(up[,"Estimate"],decreasing=TRUE), ][1:min(max.genes,nrow(up)),,drop=FALSE]
+dn <- lmRes[lmRes$Estimate<0 & lmRes$fdr<=max.fdr,]
+dn <- dn[order(dn[,"Estimate"],decreasing=FALSE),][1:min(max.genes,nrow(dn)),,drop=FALSE]
+tmp <- rbind(up,dn); tmp <- tmp[order(tmp[,"Estimate"],decreasing=TRUE),]
+somaTop <- soma2[rownames(tmp),,drop=FALSE]
+
+## with rows sorted by differential score, columns clustered *within* groups
+if ( saveFigures ) png(file.path(PATH,"results/manuscript/png/aging.heatmap04.png"),width=900,height=1200)
+pheatmap.group(somaTop,main=paste("Top",max.genes,"markers/direction"),
+               group="Cohort",
+               color=gheatmapColors,
+               annotation_col = annot_col,
+               annotation_row = annot_row[featureNames(somaTop),,drop=FALSE],
+               annotation_colors = annotColors,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               cluster_rows = FALSE,
+               labels_row = fData(somaTop)[,"symbol"],
+               fontsize_row=4,
+               scale = "row")
+if ( saveFigures ) dev.off()
+```
+
+### Hyper-Enrichment of Aging Signature
+
+We first define up, down, and combined signatures.
+
+```{r aging.signatures}
+signatures <-
+    list(small=list(up=toupper(unique(lmRes[lmRes$fdr<=max.fdr & lmRes$Estimate> +log2(1.5),"geneID"])),
+                    dn=toupper(unique(lmRes[lmRes$fdr<=max.fdr & lmRes$Estimate< -log2(1.25),"geneID"]))),
+         large=list(up=toupper(unique(lmRes[lmRes$fdr<=max.fdr & lmRes$Estimate> +log2(1.0),"geneID"])),
+                    dn=toupper(unique(lmRes[lmRes$fdr<=max.fdr & lmRes$Estimate< -log2(1.0),"geneID"]))))
+
+## assign duplicate geneID's to direction w/ higher estimate
+remove.overlap <- function( DIF, SIG )
+{
+    and <- intersect(SIG$up,SIG$dn)
+    UP <- DIF[DIF$Estimate> 0,]; UP <- UP[match(and,UP[,"geneID"]),"Estimate"];names(UP) <- and
+    DN <- DIF[DIF$Estimate< 0,]; DN <- DN[match(and,DN[,"geneID"]),"Estimate"];names(DN) <- and
+    SIG$up <- setdiff(SIG$up,and[which(UP<DN)])
+    SIG$dn <- setdiff(SIG$dn,and[which(UP>DN)])
+    SIG  
+}
+signatures$large <- remove.overlap( lmRes, signatures$large )
+signatures$small <- remove.overlap( lmRes, signatures$small )
+
+signatures$small$or <- unique(c(signatures$small$up,signatures$small$dn))
+signatures$large$or <- unique(c(signatures$large$up,signatures$large$dn))
+sapply(signatures,function(z) sapply(z,length))
+```
+
+We then upload and pre-process the annotation compendia, and test the
+signatures.
+
+```{r hypeR, echo=FALSE, eval=FALSE}
+msigdb_path <- msigdb_download_all(species="Homo sapiens")
+background  <- unique(fData(soma2)[,"symbol"])
+outStub <- "results/pathwayEnrichment.hypeR.aging"
+
+## 2. Load some genesets
+HALL <- msigdb_fetch(msigdb_path, "H") 
+REACTOME <- msigdb_fetch(msigdb_path, "C2.CP.REACTOME")
+GOBP <- msigdb_fetch(msigdb_path, "C5.BP")
+
+HYPhall <- lapply(signatures, hypeR, gsets=HALL, bg=background )
+sapply(names(HYPhall), function(Z) {
+    hyp_to_excel(HYPhall[[Z]], file_path=file.path(PATH,paste(outStub,Z,"hallmarks.xlsx",sep=".")))
+})
+HYPc2r <- lapply(signatures, hypeR, gsets=REACTOME, bg=background )
+sapply(names(HYPc2r), function(Z) {
+    hyp_to_excel(HYPc2r[[Z]], file_path=file.path(PATH,paste(outStub,Z,"c2reactome.xlsx",sep=".")))
+})
+HYPgobp <- lapply(signatures, hypeR, gsets=GOBP, bg=background )
+sapply(names(HYPgobp), function(Z) { 
+    hyp_to_excel(HYPgobp[[Z]], file_path=file.path(PATH,paste(outStub,Z,"GO_BP.xlsx",sep=".")))
+})
+hyp_to_rmd(HYPhall,
+           file_path=file.path(PATH,paste0(outStub,".hallmarks.Rmd")), 
+           title="Hallmarks Enrichment (hypeR)",
+           subtitle="Aging signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE,
+           show_emaps=TRUE,
+           show_hmaps=FALSE)
+hyp_to_rmd(HYPc2r,
+           file_path=file.path(PATH,paste0(outStub,".c2reactome.Rmd")), 
+           title="C2 Reactome Enrichment (hypeR)",
+           subtitle="Aging signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE, 
+           show_emaps=TRUE,
+           show_hmaps=FALSE)
+hyp_to_rmd(HYPgobp,
+           file_path=file.path(PATH,paste0(outStub,".GO_BP.Rmd")), 
+           title="GO BP Enrichment (hypeR)",
+           subtitle="Aging signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE, 
+           show_emaps=TRUE,
+           show_hmaps=FALSE)
+```
+
+### Enrichment Map
+
+```{r enrichment.map, eval=FALSE, echo=FALSE}
+
+## "LARGE" reactome 
+hypdat <- readRDS(file.path(system.file("extdata", package="hypeR"), "hypdat.rds"));
+rgsets <- hypdat$rgsets;
+
+HYPhr <- lapply(signatures, hypeR, gsets=rgsets, bg=background )
+sapply(names(HYPhr), function(Z) { 
+    hyp_to_excel(HYPhr[[Z]], file_path=file.path(PATH,paste(outStub,Z,"REACTOME.xlsx",sep=".")))
+})
+hyp_to_rmd(HYPhr,
+           file_path=file.path(PATH,paste0(outStub,".REACTOME.Rmd")), 
+           title="REACTOME (hypeR)",
+           subtitle="Aging signatures",
+           author="Stefano Monti",
+           show_dots=FALSE,
+           show_tables=TRUE,
+           show_emaps=FALSE,
+           show_hmaps=TRUE)
+
+## "SMALL" reactome (one level of abstraction up)
+rgsets <- readRDS(file.path(PATH,"data/rgsets.rds"))
+
+HYPhr300 <- lapply(signatures, hypeR, gsets=rgsets, bg=background )
+sapply(names(HYPhr300), function(Z) { 
+    hyp_to_excel(HYPhr300[[Z]], file_path=file.path(PATH,paste(outStub,Z,"REACTOME300.xlsx",sep=".")))
+})
+hyp_to_rmd(HYPhr300,
+           file_path=file.path(PATH,paste0(outStub,".REACTOME300.Rmd")), 
+           title="REACTOME small (hypeR)",
+           subtitle="Aging signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE,
+           show_emaps=FALSE,
+           show_hmaps=TRUE)
+```
+
+### Pathway-Based Diffanal & Heatmaps
+
+A look at the pathway level (by looking at the geneset-projected
+data), confirms the lack of a phenotype-driven (offspring vs. control)
+pattern.
+
+```{r aging.differential.gsp}
+## see analysis02.somascan.gsp.Rmd 
+somaC2cp.file <- file.path(PATH,"workdir/somascan/somaC2cp.RDS")
+somaHall.file <- file.path(PATH,"workdir/somascan/somaHall.RDS")
+
+somaC2cp <- readRDS(somaC2cp.file)
+somaHall <- readRDS(somaHall.file)
+
+## perform diffanal based on C2.CP
+lmC2cp <- gsets.diffanal(gspDat.file=file.path(PATH,"workdir/somascan/somaC2cp.RDS"),interactive=interactive,
+                         max.fdr=.001,max.genes=50,do.prune=TRUE,outpath="manuscript/",do.write=TRUE,do.heatmap=TRUE,
+                         heat.col=pheatmapColors, annot_col=annot_col, annotColors=annotColors, fontsize_row=3)
+
+## ..and on Hallmarks
+lmHall <- gsets.diffanal(gspDat.file=file.path(PATH,"workdir/somascan/somaHall.RDS"),interactive=interactive,
+                         max.fdr=0.05,max.genes=+Inf,do.prune=TRUE,outpath="manuscript/",do.write=TRUE, do.heatmap=TRUE,
+                         heat.col=pheatmapColors, annot_col=annot_col, annotColors=annotColors, fontsize_row=9)
+```
+
+## Offspring vs. Control
+
+We carry out the analysis comparing Centenarians' offsprings to
+control. Regardless of how we perform the analysis, whether by using a
+standard linear model (`lm`), or a hierarchical Bayesian model as
+implemented in `limma`, no significant differential markers emerge.
+
+
+### Analyte-Based Diffanal
+
+```{r offsprings.diffanal}
+off2 <- soma2[,soma2$Cohort!="Centenarian"]
+off2$Cohort <- droplevels(off2$Cohort)
+table(off2$Cohort)
+
+## diffanal: simple linear model
+diffOff <- as.data.frame(
+    t(sapply( 1:nrow(off2),
+             function(i) {
+                 tmp <- lm(exprs(off2)[i,] ~ Cohort + Gender + Year.completed, data=pData(off2))
+                 summary(tmp)$coefficients["CohortOffspring",c("Estimate","Pr(>|t|)")]
+             }))
+)
+rownames(diffOff) <- featureNames(off2)
+diffOff <- cbind(geneID=fData(off2)$symbol,diffOff)
+diffOff <- diffOff[order(diffOff[,"Pr(>|t|)"]),]
+diffOff$fdr <- p.adjust(diffOff[,"Pr(>|t|)"], method="BH")
+
+## save analysis results
+saveRDS(diffOff,file=file.path(PATH,"workdir/somascan/diffOff.RDS"))
+write.xlsx(diffOff,file=file.path(PATH,"results/manuscript/diffOff.xlsx"),row.names=TRUE)
+
+## number of analytes
+print( rbind(analytes=c("fdr<=0.25"=sum(diffOff$fdr<=.05), "fdr<=0.05"=sum(diffOff$fdr<=.01)),
+             proteins=c("fdr<=0.25"=length(unique(diffOff$geneID[diffOff$fdr<=.05])),
+                 "fdr<=0.05"=length(unique(diffOff$geneID[diffOff$fdr<=.01])))) )
+
+## diffanal: limma based
+design <- model.matrix(~Cohort+Gender+Year.completed,data=pData(off2))
+colnames(design) <- gsub("Gender","",gsub("Cohort","",colnames(design)))
+fit <- lmFit(off2, design)
+fit <- eBayes(fit)
+limmaOff <- topTable(fit, coef="Offspring",adjust.method = "BH", n = Inf)
+
+print( rbind(analytes=c("fdr<=0.25"=sum(limmaOff$adj.P.Val<=.05), "fdr<=0.05"=sum(limmaOff$adj.P.Val<=.01)),
+             proteins=c("fdr<=0.25"=length(unique(limmaOff$geneID[limmaOff$adj.P.Val<=.05])),
+                 "fdr<=0.05"=length(unique(limmaOff$geneID[limmaOff$adj.P.Val<=.01])))) )
+
+## compare the two
+plot(limmaOff$logFC,diffOff[rownames(limmaOff),"Estimate"],xlab="limma",ylab="lm")
+```
+
+### Analyte-Based Heatmap
+
+The lack of signal is also apparent when we plot the data with the
+rows sorted by their differential score (with offspring markers on
+top, and control markers at the bottom).
+
+```{r offsprings.heatmap}
+diffOff01 <- diffOff[diffOff$fdr<=1.0,]; diffOff01 <- diffOff01[order(diffOff01$Estimate,decreasing=TRUE),]
+offLM <- off2[rownames(diffOff01),]
+annot_row <- data.frame(markers=c("down","up")[as.integer(diffOff$Estimate>0)+1])
+rownames(annot_row) <- rownames(diffOff)
+
+## with rows sorted by differential score, columns clustered *within* groups
+pheatmap.group(offLM,
+               group="Cohort",
+               color=gheatmapColors,
+               annotation_col = annot_col[sampleNames(offLM),,drop=FALSE],
+               annotation_row = annot_row[featureNames(offLM),,drop=FALSE],
+               annotation_colors = annotColors,
+               show_rownames = FALSE,
+               show_colnames = FALSE,
+               cluster_rows = FALSE,
+               scale = "row")
+```
+
+### Pathway-Based Heatmaps
+
+```{r offsprings.differential.gsp}
+somaC2cpOff <- somaC2cp[,sampleNames(off2)]; somaC2cpOff$Cohort <- droplevels(somaC2cpOff$Cohort)
+somaHallOff <- somaHall[,sampleNames(off2)]; somaHallOff$Cohort <- droplevels(somaHallOff$Cohort)
+saveRDS(somaC2cpOff,file=file.path(PATH,"workdir/somascan/somaC2cpOff.RDS"))
+saveRDS(somaHallOff,file=file.path(PATH,"workdir/somascan/somaHallOff.RDS"))
+##somaC2cpOff <- readRDS(file=file.path(PATH,"workdir/somascan/somaC2cpOff.RDS"))
+##somaHallOff <- readRDS(file=file.path(PATH,"workdir/somascan/somaHallOff.RDS"))
+
+## perform diffanal based on C2.CP
+lmC2cp <- gsets.diffanal(gspDat.file=file.path(PATH,"workdir/somascan/somaC2cpOff.RDS"),interactive=interactive,
+                         max.fdr=1.0,max.genes=40,do.prune=TRUE,group="Offspring", heat.col=pheatmapColors,
+                         do.heatmap=TRUE, annot_col=annot_col, annotColors=annotColors, fontsize_row=5)
+
+## ..and on Hallmarks
+lmHall <- gsets.diffanal(gspDat.file=file.path(PATH,"workdir/somascan/somaHallOff.RDS"),interactive=interactive,
+                         max.fdr=1.0,max.genes=+Inf,do.prune=TRUE,group="Offspring", heat.col=pheatmapColors,
+                         do.heatmap=TRUE, annot_col=annot_col, annotColors=annotColors, fontsize_row=9)
+```
+
+### Restricting to surviving Offsprings
+
+```{r surviving.offsprings}
+off3 <- off2[,!is.na(off2$Age.serum)]
+off3$FU <- off3$Age-off3$Age.serum; off3$FU[off3$FU<0] <- 0
+off3$age.group <- cut(off3$Age.serum,breaks=c(45,71,100),right=FALSE,incluse.lowest=TRUE)
+off3$FU.2group <- cut(off3$FU,breaks=c(0,11,Inf),right=FALSE,include.lowest=TRUE)
+off3$FU.2group[off3$FU.2group=="[0,11)" & off3$Deceased=="No"] <- NA
+table(off3$age.group,off3$FU.2group,useNA="ifany")
+```
+
+## Longevity Signature
+
+### Survival Grouping of Centenarians
+
+We group centenarians into two categories based on the length of their survival.
+
+```{r cent.prepare}
+cent <- soma2[,soma2$Cohort=="Centenarian"] 
+cent$FU <- cent$Age-cent$Age.serum; cent$FU[cent$FU<0] <- 0
+cent$age.group <- cut(cent$Age.serum,breaks=c(100,105,110,200),right=FALSE,incluse.lowest=TRUE)
+cent$FU.2group <- cut(cent$FU,breaks=c(0,2,Inf),right=FALSE,include.lowest=TRUE)
+cent <- cent[,!is.na(cent$age.group)]
+table(cent$age.group,cent$FU.2group,useNA="ifany")
+```
+
+### Analyte-Based Centenarians Diffanal
+
+```{r longevity.diffanal.cent}
+## 2 groups (lm)
+centRes2 <- data.frame(t(apply( exprs(cent), 1, function(Y) {
+    fit <- lm(Y ~ cent$Gender+cent$age.group+cent$FU.2group)
+    summary(fit)$coefficients["cent$FU.2group[2,Inf]",c("Estimate","t value","Pr(>|t|)")]
+})),check.names=FALSE)
+colnames(centRes2) <- c("beta[2,Inf]","t","p.value")
+centRes2$FDR <- p.adjust(centRes2$p.value,method="BH")
+centRes2$symbol <- fData(cent)[rownames(centRes2),"symbol"]
+head(centRes2[order(centRes2$FDR),])
+c('pval<0.005'=sum(centRes2$p.value<=0.005),'fdr<0.25'=sum(centRes2$FDR<=0.25))
+
+saveRDS(centRes2,file=file.path(PATH,"workdir/manuscript/centRes2.RDS"))
+write.xlsx(centRes2,rowNames=TRUE,file=file.path(PATH,"results/manuscript/longevitySignature.centenarians.lm.xlsx"))
+```
+
+#### Analyte-Based Centenarians Heatmaps 
+
+```{r cent.heatmaps.2group}
+## 2 groups
+annot_col.cent2 <- pData(cent)[,c("age.group","FU.2group")]
+annotColors.cent2 <- list(age.group=c("lightgray","gray","black"),
+                          FU.2group=c("lightblue","pink"),
+                          markers=c(up="darkred",down="darkgreen"))
+names(annotColors.cent2$age.group) <- levels(cent$age.group)
+names(annotColors.cent2$FU.2group) <- levels(cent$FU.2group)
+
+annot_row.cent2 <- data.frame(markers=c("down","up")[as.integer(centRes2[,"beta[2,Inf]"]>0)+1])
+rownames(annot_row.cent2) <- rownames(centRes2)
+
+idx <- centRes2$p.value<=0.005
+cent2 <- cent[rownames(centRes2)[idx],]
+cent2 <- cent2[order(centRes2[idx,"beta[2,Inf]"],decreasing=TRUE),]
+hcRow <- hcopt(as.dist(1-cor(t(exprs(cent2)),use="pairwise.complete.obs")),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(cent2))),,method="ward.D")
+
+## heatmap clustering columns within phenotypes
+pheatmap.group(mat=cent2, main="samples clustered within phenotype, markers sorted",
+               group="FU.2group",
+               color=gheatmapColors,
+               annotation_col = annot_col.cent2,
+               annotation_row = annot_row.cent2[rownames(cent2),,drop=FALSE],
+               annotation_colors = annotColors.cent2,
+               cluster_rows = FALSE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(cent2)$symbol,
+               fontsize_row=7,
+               border_color=NA,
+               scale = "row")
+
+## heatmap clustering columns within phenotypes
+pheatmap.group(mat=cent2, main="samples clustered within phenotype, markers clustered",
+               group="FU.2group",
+               color=gheatmapColors,
+               annotation_col = annot_col.cent2,
+               annotation_row = annot_row.cent2[rownames(cent2),,drop=FALSE],
+               annotation_colors = annotColors.cent2,
+               cluster_rows = TRUE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(cent2)$symbol,
+               fontsize_row=6,
+               border_color=NA,
+               scale = "row")
+
+## heatmap clustering columns across phenotypes
+pheatmap(exprs(cent2), main="samples and markers clustered",
+         color=gheatmapColors,
+         annotation_col = annot_col.cent2,
+         annotation_colors = annotColors.cent2,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         labels_row=fData(cent2)$symbol,
+         fontsize_row=6,
+         border_color=NA,
+         scale = "row")
+```
+
+### Pathway-Based Centenarians Analysis
+
+We now perform differential analysis in the space of geneset
+projection scores, both for C2.CP and hallmarks.
+
+```{r diffanal.cent.gsp}
+somaC2cp.cent2 <- somaC2cp[,sampleNames(cent2)]
+pData(somaC2cp.cent2) <- pData(cent2)
+somaHall.cent2 <- somaHall[,sampleNames(cent2)]
+pData(somaHall.cent2) <- pData(cent2)
+
+## perform diffanal based on Hallmarks
+lmC2cp <-
+    gsets.longevity.diffanal(somaC2cp.cent2,outpath="manuscript/",base.file="somaC2cp.cent2",
+                             max.fdr=0.3, annot=annot_col.cent2, annotColors=annotColors.cent2, fontsize_row=3,
+                             heat.col=pheatmapColors, do.prune=TRUE,do.heatmap=TRUE,interactive=interactive)
+lmHall <-
+    gsets.longevity.diffanal(somaHall.cent2,outpath="manuscript/",base.file="somaHall.cent2",
+                             max.pval=0.05, annot=annot_col.cent2, annotColors=annotColors.cent2, fontsize_row=12,
+                             heat.col=pheatmapColors, do.prune=TRUE,do.heatmap=TRUE,interactive=interactive)
+```
+
+### Survival Grouping of Offs+Controls
+
+We group offsprings and controls into two categories based on the
+length of their survival. 
+
+```{r rest.prepare}
+rest <- soma2[,soma2$Cohort!="Centenarian"]; rest$Cohort <- droplevels(rest$Cohort)
+rest$FU <- rest$Age-rest$Age.serum; rest$FU[rest$FU<0] <- 0
+rest$age.group <- cut(rest$Age.serum,breaks=c(45,71,100),right=FALSE,incluse.lowest=TRUE)
+rest$FU.2group <- cut(rest$FU,breaks=c(0,11,Inf),right=FALSE,include.lowest=TRUE)
+rest$FU.2group[rest$FU.2group=="[0,11)" & rest$Deceased=="No"] <- NA
+table(rest$age.group,rest$FU.2group,useNA="ifany")
+```
+Notice that several subjects (n=`r sum(is.na(rest$FU.2group))`) are
+lost due to the lack of follow-up information.
+
+```{r missing.followup} 
+## eliminate the un-annotated samples
+rest1 <- rest[,!is.na(rest$age.group) & !is.na(rest$FU.2group)]
+saveRDS(rest1,file=file.path(PATH,"workdir/rest1.RDS"))
+table(rest1$age.group,rest1$FU.2group,useNA="ifany") 
+```
+
+### Analyte-Based Offs+Controls Diffanal
+
+```{r offspring.regression}
+
+## lm
+restRes2 <- data.frame(t(apply( exprs(rest1), 1, function(Y) {
+    fit <- lm(Y ~ rest1$Gender+rest1$age.group+rest1$FU.2group)
+    summary(fit)$coefficients["rest1$FU.2group[11,Inf]",c("Estimate","t value","Pr(>|t|)")]
+})),check.names=FALSE)
+colnames(restRes2) <- c("beta[11,Inf]","t","p.value")
+
+restRes2$FDR <- p.adjust(restRes2$p,method="BH")
+restRes2$symbol <- fData(rest1)[rownames(restRes2),"symbol"]
+head(restRes2[order(restRes2$FDR),])
+c('pval<0.005'=sum(restRes2$p.value<=0.005),
+  'pval<0.001'=sum(restRes2$p.value<=0.001),
+  'fdr<0.10'=sum(restRes2$FDR<=0.10),
+  'fdr<0.25'=sum(restRes2$FDR<=0.25))
+
+saveRDS(restRes2,file=file.path(PATH,"workdir/manuscript/restRes2.RDS"))
+##restRes2 <- readRDS(file.path(PATH,"workdir/manuscript/restRes2.RDS"))
+write.xlsx(restRes2,rowNames=TRUE,file=file.path(PATH,"results/manuscript/longevitySignature.offsprings.lm.xlsx"))
+```
+
+#### Analyte-Based Offs+Controls Heatmaps
+
+```{r rest.heatmaps.2group}
+## 2 groups
+annot_col.rest2 <- pData(rest)[,c("Cohort","age.group","FU.2group")]
+annotColors.rest2 <- list(age.group=c("lightgray","darkgray"),
+                          FU.2group=c("lightblue","pink"),
+                          Cohort=c("yellow2","yellow3"),
+                          markers=c(up="darkred",down="darkgreen"))
+names(annotColors.rest2$age.group) <- levels(rest$age.group)
+names(annotColors.rest2$FU.2group) <- levels(rest$FU.2group)
+names(annotColors.rest2$Cohort) <- levels(rest$Cohort)
+
+annot_row.rest2 <- data.frame(markers=c("down","up")[as.integer(restRes2[,"beta[11,Inf]"]>0)+1])
+rownames(annot_row.rest2) <- rownames(restRes2)
+
+idx <- restRes2$p.value<=0.0025
+rest2 <- rest1[rownames(restRes2)[idx],][order(restRes2[idx,"t"],decreasing=TRUE),]
+saveRDS(rest2,file=file.path(PATH,"workdir/rest2.RDS"))
+hcRow <- hcopt(as.dist(1-cor(t(exprs(rest2)),use="pairwise.complete.obs")),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(rest2))),method="ward.D")
+
+## heatmap clustering columns within phenotypes
+pheatmap.group(mat=rest2,main="samples clustered within phenotype, markers sorted",
+               group="FU.2group",
+               color=gheatmapColors,
+               annotation_col = annot_col.rest2[sampleNames(rest2),,drop=FALSE],
+               annotation_row = annot_row.rest2[featureNames(rest2),,drop=FALSE],
+               annotation_colors = annotColors.rest2,
+               cluster_rows=FALSE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(rest2)$symbol,
+               fontsize_row=5,
+               scale = "row")
+
+## heatmap clustering columns within phenotypes
+pheatmap.group(mat=rest2,main="samples clustered within phenotype, markers clustered",
+               group="FU.2group",
+               color=gheatmapColors,
+               annotation_col = annot_col.rest2[sampleNames(rest2),,drop=FALSE],
+               annotation_row = annot_row.rest2[featureNames(rest2),,drop=FALSE],
+               annotation_colors = annotColors.rest2,
+               cluster_rows=TRUE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(rest2)$symbol,
+               fontsize_row=5,
+               scale = "row")
+
+## heatmap clustering columns across phenotypes
+pheatmap(exprs(rest2),main="samples and markers clustered",
+         color=gheatmapColors,
+         annotation_col = annot_col.rest2[sampleNames(rest2),,drop=FALSE],
+         annotation_row = annot_row.rest2[featureNames(rest2),,drop=FALSE],
+         annotation_colors = annotColors.rest2,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         labels_row=fData(rest2)$symbol,
+         fontsize_row=5,
+         scale = "row")
+```
+
+### Pathway-Based Offs+Controls Analysis
+
+We now perform differential analysis in the space of geneset
+projection scores, both for C2.CP and hallmarks.
+
+```{r diffanal.rest.gsp}
+somaC2cp.rest2 <- somaC2cp[,sampleNames(rest2)]
+pData(somaC2cp.rest2) <- pData(rest2)
+somaHall.rest2 <- somaHall[,sampleNames(rest2)]
+pData(somaHall.rest2) <- pData(rest2)
+
+## perform diffanal based on Hallmarks
+lmC2cp <- gsets.longevity.diffanal(somaC2cp.rest2,outpath="manuscript/",base.file="somaC2cp.rest2",do.prune=TRUE,max.fdr=0.35,
+                                   do.heatmap=TRUE, annot=annot_col.rest2, annotColors=annotColors.rest2, fontsize_row=7,
+                                   heat.col=pheatmapColors, interactive=interactive)
+lmHall <- gsets.longevity.diffanal(somaHall.rest2,outpath="manuscript/",base.file="somaHall.rest2",do.prune=TRUE,max.fdr=1.0,
+                                   do.heatmap=TRUE, annot=annot_col.rest2, annotColors=annotColors.rest2, fontsize_row=12,
+                                   heat.col=pheatmapColors, interactive=interactive)
+```
+
+### Centenarians vs. Offspring' Signatures
+
+No significant overlap between the Centenarians' and the Offsprings' signatures.
+
+```{r cent.vs.offspring}
+require(VennDiagram)
+
+##centRes2 <- readRDS(file=file.path(PATH,"workdir/manuscript/centRes2.RDS"))
+##restRes2 <- readRDS(file=file.path(PATH,"workdir/manuscript/restRes2.RDS"))
+
+pval <- 0.05
+diff_list <- list(cent.up=centRes2[centRes2$p.value<=pval & centRes2[,"beta[2,Inf]"]>0,"symbol"],
+                  cent.dn=centRes2[centRes2$p.value<=pval & centRes2[,"beta[2,Inf]"]<0,"symbol"],
+                  rest.up=restRes2[restRes2$p.value<=pval & restRes2[,"beta[11,Inf]"]>0,"symbol"],
+                  rest.dn=restRes2[restRes2$p.value<=pval & restRes2[,"beta[11,Inf]"]<0,"symbol"])
+
+fill <- c("light blue", "pink","orange","yellow")
+size  <- rep(0.5,4)
+venn <- venn.diagram(x = diff_list,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = paste0("Overlap of Signficant genes (p < ", pval, ")"),
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=length(unique(fData(soma2)$symbol)))
+grid.draw(venn)
+diff_list <- c(diff_list,
+               list(up=intersect(diff_list$cent.up,diff_list$rest.up),
+                    dn=intersect(diff_list$cent.dn,diff_list$rest.dn)))
+
+save(diff_list,file=file.path(PATH,"workdir/diff_list.RDS"))
+
+## longevity signature intersection (btw centenarians and rest)
+print(diff_list[c("up","dn")])
+write.xlsx(list2table(diff_list),file=file.path(PATH,"results/manuscript/longevitySignature.lm.xlsx"))
+```
+
+### Pooled Analysis
+
+Here, we look first at the longevity markers in the overlap between controls
+and centenarians. We then perform an actual pooled analysis.
+
+```{r combine.datasets}
+comb <- soma2[,c(sampleNames(rest1),sampleNames(cent))]
+FUgroups <- c("short","long")
+comb$FU <- factor(c(FUgroups[rest1$FU.2group],FUgroups[cent$FU.2group]),levels=FUgroups)
+comb$Cohort2 <- factor(c(paste("control",rest1$age.group),paste("centenarian",cent$age.group)),
+                       levels=c(paste("control",levels(rest1$age.group)),paste("centenarian",levels(cent$age.group))))
+
+## just checking
+table(pData(comb)[sampleNames(rest1),"Cohort2"],rest1$age.group)
+table(pData(comb)[sampleNames(cent),"Cohort2"],cent$age.group)
+## more checking
+table(pData(comb)[sampleNames(rest1),"FU"],rest1$FU.2group)
+table(pData(comb)[sampleNames(cent),"FU"],cent$FU.2group) 
+```
+
+#### Heatmap of Overlap signature
+
+```{r overlap.signature.heatmap}
+## diff_list <- readRDS(file.path(PATH,"workdir/diff_list.RDS"))
+combOverlap <- comb[match(unlist(diff_list[c("up","dn")]),fData(comb)[,"symbol"]),] 
+```
+
+```{r combined.color.coding}
+## 2 groups 
+annot_col.comb <- pData(comb)[,c("Cohort2","FU")]
+annotColors.comb <- list(Cohort2=colGradient(c("white","black"),5),
+                         FU=c("lightblue","pink"),
+                         markers=c(up="darkred",down="darkgreen"))
+names(annotColors.comb$Cohort2) <- levels(comb$Cohort2)
+names(annotColors.comb$FU) <- levels(comb$FU)
+
+annot_row.comb <-
+    data.frame(markers=c("down","up")[as.integer(fData(combOverlap)[,"symbol"] %in% diff_list$up)+1])
+rownames(annot_row.comb) <- rownames(combOverlap) 
+
+hcRow <- hcopt(as.dist(1-cor(t(exprs(combOverlap)),use="pairwise.complete.obs")),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(combOverlap))),,method="ward.D")
+
+## heatmap clustering columns within phenotypes, markers sorted
+pheatmap.group(mat=combOverlap, main="samples clustered within Cohort, markers sorted",
+               group="Cohort2",
+               color=gheatmapColors, 
+               annotation_col = annot_col.comb,
+               annotation_row = annot_row.comb[rownames(combOverlap),,drop=FALSE],
+               annotation_colors = annotColors.comb,
+               cluster_rows = FALSE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(combOverlap)$symbol,
+               fontsize_row=5,
+               scale = "row")
+
+CO1 <- combOverlap[,order(combOverlap$Cohort2,combOverlap$FU)]
+pheatmap(exprs(CO1), main="samples ordered by Cohort+FU, markers sorted",
+         color=gheatmapColors,
+         annotation_col = annot_col.comb,
+         annotation_row = annot_row.comb[rownames(CO1),,drop=FALSE],
+         annotation_colors = annotColors.comb,
+         cluster_rows=FALSE,
+         cluster_cols=FALSE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         labels_row=fData(CO1)$symbol,
+         fontsize_row=5,
+         scale="row")
+         
+```
+
+#### Pooled diffanal
+
+We regress on follow-up length across cohorts (short vs. long,
+differently defined in the controls and the centenarians), while
+controlling for the Cohort effect.
+
+```{r combined.diffanal}
+## run ANCOVA
+combRes2 <- data.frame(t(apply( exprs(comb), 1, function(Y) {
+    fit <- lm(Y ~ comb$Gender+comb$Cohort2+comb$FU)
+    summary(fit)$coefficients["comb$FUlong",c("Estimate","t value","Pr(>|t|)")]
+})),check.names=FALSE)
+colnames(combRes2) <- c("beta(long)","t","p.value")
+## compute q-values, append gene symbols, and compute within-group means
+combRes2$FDR <- p.adjust(combRes2$p,method="BH")
+combRes2$symbol <- fData(comb)[rownames(combRes2),"symbol"]
+tmp <- fast.mean(exprs(comb),cls=comb$FU,na.rm=TRUE)
+combRes2 <- cbind(combRes2,tmp[rownames(combRes2),])
+combRes2 <- combRes2[order(combRes2$FDR),]
+head(combRes2)
+c('pval<0.005'=sum(combRes2$p.value<=0.005),
+  'pval<0.001'=sum(combRes2$p.value<=0.001),
+  'fdr<0.05'=sum(combRes2$FDR<=0.05),
+  'fdr<0.10'=sum(combRes2$FDR<=0.10),
+  'fdr<0.25'=sum(combRes2$FDR<=0.25))
+
+##combRes2 <- readRDS(file.path(PATH,"workdir/manuscript/combRes2.RDS"))
+saveRDS(combRes2,file=file.path(PATH,"workdir/manuscript/combRes2.RDS"))
+write.xlsx(combRes2,rowNames=TRUE,file=file.path(PATH,"results/manuscript/longevitySignature.combined.lm.xlsx"))
+```
+
+#### Pooled Signature Hyper-Enrichment
+
+```{r pooled.hypeR, eval=FALSE}
+pooledSig <- list(pval005=unique(combRes2[combRes2$p.value<=0.005,"symbol"]),
+                  pval001=unique(combRes2[combRes2$p.value<=0.001,"symbol"]),
+                  fdr10=unique(combRes2[combRes2$FDR<=0.10,"symbol"]))
+
+## 1. Download MSigDB for temporary sessions 
+msigdb_path <- msigdb_download_all(species="Homo sapiens")
+
+## 2. Load some genesets
+HALL <- msigdb_fetch(msigdb_path, "H")
+REACTOME <- msigdb_fetch(msigdb_path, "C2.CP.REACTOME")
+gsets <- c(HALL, REACTOME)
+ 
+## 3. Run hypeR
+hyperOut <- hypeR(signature=pooledSig, gsets=gsets, bg=nrow(soma2))
+#p <- hyp_dots(hyperOut,show_plots=FALSE,return_plots=TRUE)
+
+hyp_to_excel(hyperOut,
+             file_path=file.path(PATH,"results/pathwayEnrichment.hypeR.pooledSignature.xlsx"))
+
+hyp_to_rmd(hyperOut,
+           file_path=file.path(PATH,"results/pathwayEnrichment.hypeR.pooledSignature.Rmd"), 
+           title="Hyper Enrichment (hypeR)",
+           subtitle="Pooled longevity signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE,
+           show_emaps=TRUE,
+           show_hmaps=FALSE)
+
+longevityGsets <- readRDS(file.path(PATH,"workdir/longevitySignatures.RDS"))
+longevityGsets <- longevityGsets[-(1:4)]
+hyperOut1 <- hypeR(signature=pooledSig, gsets=longevityGsets, bg=nrow(soma2))
+#p <- hyp_dots(hyperOut1,show_plots=FALSE,return_plots=TRUE)
+hyp_to_rmd(hyperOut1, 
+           file_path=file.path(PATH,"results/pathwayEnrichment.hypeR.longevityGsets.Rmd"),
+           title="hypeR w/ longevity Genesets",
+           subtitle="Pooled longevity signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE,
+           show_emaps=TRUE,
+           show_hmaps=FALSE)
+```
+
+```{r pooled.enrichment.map, eval=FALSE}
+rgsets <- hyperdb_fetch(type="rgsets", "REACTOME") 
+
+hyperOut2 <- hypeR(signature=pooledSig, gsets=rgsets, bg=nrow(soma2))
+hyp_to_rmd(hyperOut2, 
+           file_path=file.path(PATH,"results/pathwayEnrichment.hypeR.emaps.Rmd"),
+           title="hypeR w/ hierarchical genesets",
+           subtitle="Pooled longevity signatures",
+           author="Stefano Monti",
+           show_dots=TRUE,
+           show_tables=TRUE,
+           show_emaps=FALSE,
+           show_hmaps=TRUE)
+```
+
+#### Pooled vs. Aging Signature Overlap
+
+Here, we look at the overlap between the pooled longevity signature
+and the aging signature.
+
+```{r pooled.x.aging}
+ntotal <- length(unique(fData(soma2)$symbol))
+pval <- 0.005
+diff_list <- list(pool.up=row.names(combRes2)[combRes2$p.value<=pval & combRes2$t>0],
+                  pool.dn=row.names(combRes2)[combRes2$p.value<=pval & combRes2$t<0],
+                  aging.up=row.names(lmRes)[lmRes$fdr<=0.01 & lmRes$Estimate>0],
+                  aging.dn=row.names(lmRes)[lmRes$fdr<=0.01 & lmRes$Estimate<0])
+fill <- c("light blue", "pink","orange","yellow")
+size  <- rep(0.5,4) 
+venn <- venn.diagram(x = diff_list,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = paste0("Overlap of Aging and Pooled Signatures (pooled p < ", pval, ")"),
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=ntotal)
+grid.draw(venn)
+
+print(intersect(diff_list$pool.up,diff_list$aging.up))
+print(intersect(diff_list$pool.dn,diff_list$aging.dn))
+
+pval <- 0.10
+diff_list <- list(pool.up=row.names(combRes2)[combRes2$FDR<=pval & combRes2$t>0],
+                  pool.dn=row.names(combRes2)[combRes2$FDR<=pval & combRes2$t<0],
+                  aging.up=row.names(lmRes)[lmRes$fdr<=0.01 & lmRes$Estimate>0],
+                  aging.dn=row.names(lmRes)[lmRes$fdr<=0.01 & lmRes$Estimate<0])
+fill <- c("light blue", "pink","orange","yellow")
+size  <- rep(0.5,4) 
+venn <- venn.diagram(x = diff_list,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = paste0("Overlap of Aging and Pooled Signatures (pooled q < ", pval, ")"),
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=ntotal)
+grid.newpage()
+grid.draw(venn)
+
+```
+
+#### Pooled vs. non-Pooled Signature Overlap
+
+```{r overlap.pooled}
+ntotal <- length(unique(fData(soma2)$symbol))
+pval <- 0.25
+diff_list <- list(cent=centRes2[centRes2$p.value<=0.005,"symbol"],
+                  rest=restRes2[restRes2$p.value<=0.005,"symbol"],
+                  pool=combRes2[combRes2$FDR<=pval,"symbol"])
+
+fill <- c("light blue", "pink","orange")
+size  <- rep(0.5,3) 
+venn <- venn.diagram(x = diff_list,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = paste0("Overlap of Signficant genes (pooled q < ", pval, ")"),
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=ntotal)
+grid.newpage()
+grid.draw(venn)
+ovlp25 <- signatureOverlap(diff_list,ntotal=ntotal,outfile=file.path(PATH,"results/somascan/longevity.signatureOverlap25.xlsx"))
+print(intersect(diff_list$cent,diff_list$pool))
+print(intersect(diff_list$rest,diff_list$pool))
+print(intersect(diff_list$cent,intersect(diff_list$rest,diff_list$pool)))
+
+pval <- 0.10
+diff_list <- list(cent=centRes2[centRes2$p.value<=0.005,"symbol"],
+                  rest=restRes2[restRes2$p.value<=0.005,"symbol"],
+                  pool=combRes2[combRes2$FDR<=pval,"symbol"])
+
+venn <- venn.diagram(x = diff_list,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = paste0("Overlap of Signficant genes (pooled q < ", pval, ")"),
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=ntotal)
+grid.newpage()
+grid.draw(venn)
+
+pval <- 0.005
+diff_list <- list(cent=centRes2[centRes2$p.value<=0.005,"symbol"],
+                  rest=restRes2[restRes2$p.value<=0.005,"symbol"],
+                  pool=combRes2[combRes2$p.value<=pval,"symbol"])
+
+venn <- venn.diagram(x = diff_list,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = paste0("Overlap of Signficant genes (pooled p < ", pval, ")"),
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=ntotal)
+grid.newpage()
+grid.draw(venn)
+
+
+ovlp10 <- signatureOverlap(diff_list,ntotal=ntotal,outfile=file.path(PATH,"results/somascan/longevity.signatureOverlap10.xlsx"))
+print(intersect(diff_list$cent,diff_list$pool))
+print(intersect(diff_list$rest,diff_list$pool))
+print(intersect(diff_list$cent,intersect(diff_list$rest,diff_list$pool)))
+```
+
+#### Analyte-Based Heatmaps 
+
+Here, we show the heatmap of the data in the space of the pooled
+signature analytes.
+
+```{r pooled.analysis.heatmaps}
+annot_row.comb <- data.frame(markers=c("down","up")[as.integer(combRes2[,"beta(long)"]>0)+1])
+rownames(annot_row.comb) <- rownames(combRes2)
+
+idx <- combRes2$FDR<=0.10 
+combTop <- comb[rownames(combRes2)[idx],]
+combTop <- combTop[order(combRes2[idx,"beta(long)"],decreasing=TRUE),]
+hcRow <- hcopt(as.dist(1-cor(t(exprs(combTop)),use="pairwise.complete.obs")),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(combTop))),,method="ward.D")
+
+## heatmap clustering columns within phenotypes, markers sorted
+pheatmap.group(mat=combTop, main="samples clustered within phenotype, markers sorted",
+               group="FU",
+               color=gheatmapColors,
+               annotation_col = annot_col.comb,
+               annotation_row = annot_row.comb[rownames(combTop),,drop=FALSE],
+               annotation_colors = annotColors.comb,
+               cluster_rows = FALSE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(combTop)$symbol,
+               fontsize_row=5,
+               scale = "row")
+
+## heatmap clustering columns within phenotypes, markers clustered
+pheatmap.group(mat=combTop, main="samples clustered within phenotype, markers clustered",
+               group="FU",
+               color=gheatmapColors,
+               annotation_col = annot_col.comb,
+               annotation_row = annot_row.comb[rownames(combTop),,drop=FALSE],
+               annotation_colors = annotColors.comb,
+               cluster_rows = TRUE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=fData(combTop)$symbol,
+               fontsize_row=5,
+               scale = "row")
+
+## heatmap clustering columns across phenotypes
+pheatmap(exprs(combTop), main="samples and markers clustered",
+         color=gheatmapColors,
+         annotation_col = annot_col.comb,
+         annotation_colors = annotColors.comb,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         labels_row=fData(comb)$symbol,
+         fontsize_row=5,
+         scale = "row")
+
+CO1 <- combTop[,order(combTop$Cohort2,combTop$FU)]
+pheatmap(exprs(CO1), main="samples ordered by Cohort+FU, markers sorted",
+         color=gheatmapColors,
+         annotation_col = annot_col.comb,
+         annotation_row = annot_row.comb[rownames(CO1),,drop=FALSE],
+         annotation_colors = annotColors.comb,
+         cluster_rows=FALSE,
+         cluster_cols=FALSE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         labels_row=fData(CO1)$symbol,
+         fontsize_row=5,
+         scale="row")
+```
+
+#### Pooled Pathway-Based Diffanal
+
+```{r pooled.gsp.diffanal}
+somaC2cp.comb <- somaC2cp[,sampleNames(comb)]
+pData(somaC2cp.comb) <- pData(comb)
+somaHall.comb <- somaHall[,c(sampleNames(comb))]
+pData(somaHall.comb) <- pData(comb)
+
+lmC2cp.comb <- data.frame(t(apply( exprs(somaC2cp.comb), 1, function(Y) {
+    fit <- lm(Y ~ somaC2cp.comb$Gender+somaC2cp.comb$Cohort2+somaC2cp.comb$FU)
+    summary(fit)$coefficients["somaC2cp.comb$FUlong",c("Estimate","t value","Pr(>|t|)")]
+})),check.names=FALSE)
+colnames(lmC2cp.comb) <- c("beta(long)","t","p.value")
+
+lmC2cp.comb$FDR <- p.adjust(lmC2cp.comb$p,method="BH")
+tmp <- fast.mean(exprs(somaC2cp.comb),cls=somaC2cp.comb$FU,na.rm=TRUE) 
+lmC2cp.comb <- cbind(lmC2cp.comb,tmp[rownames(lmC2cp.comb),])
+lmC2cp.comb <- lmC2cp.comb[order(lmC2cp.comb$FDR),]
+head(lmC2cp.comb)
+c('pval<0.005'=sum(lmC2cp.comb$p.value<=0.005),
+  'pval<0.001'=sum(lmC2cp.comb$p.value<=0.001),
+  'fdr<0.05'=sum(lmC2cp.comb$FDR<=0.05),
+  'fdr<0.10'=sum(lmC2cp.comb$FDR<=0.10),
+  'fdr<0.25'=sum(lmC2cp.comb$FDR<=0.25))
+
+lmHall.comb <- data.frame(t(apply( exprs(somaHall.comb), 1, function(Y) {
+    fit <- lm(Y ~ somaHall.comb$Gender+somaHall.comb$Cohort2+somaHall.comb$FU)
+    summary(fit)$coefficients["somaHall.comb$FUlong",c("Estimate","t value","Pr(>|t|)")]
+})),check.names=FALSE)
+colnames(lmHall.comb) <- c("beta(long)","t","p.value")
+
+lmHall.comb$FDR <- p.adjust(lmHall.comb$p,method="BH")
+tmp <- fast.mean(exprs(somaHall.comb),cls=somaHall.comb$FU,na.rm=TRUE)
+lmHall.comb <- cbind(lmHall.comb,tmp[rownames(lmHall.comb),])
+lmHall.comb <- lmHall.comb[order(lmHall.comb$FDR),]
+head(lmHall.comb)
+c('pval<0.005'=sum(lmHall.comb$p.value<=0.005),
+  'pval<0.001'=sum(lmHall.comb$p.value<=0.001),
+  'fdr<0.05'=sum(lmHall.comb$FDR<=0.05),
+  'fdr<0.10'=sum(lmHall.comb$FDR<=0.10),
+  'fdr<0.25'=sum(lmHall.comb$FDR<=0.25))
+```

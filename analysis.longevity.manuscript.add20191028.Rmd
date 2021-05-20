@@ -1,0 +1,75 @@
+---
+title: "Follow-Up Analyses for Longevity Manuscript"
+author: "Stefano Monti"
+date: 10/28/2019
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    theme: united
+    toc: yes
+---
+
+```{r global, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE,fig.path='../results/manuscript/figures/')
+```
+
+Here, we perform further follow-up analysis.
+
+```{r settings}
+require(Biobase)
+
+## SCC 
+if ( grepl("scc",system("hostname",intern=TRUE)) ) {
+    ## NECS is /restricted/projectnb/necs/
+    PATH <- file.path( Sys.getenv("NECS"),"novartis-data/smonti")
+}
+## MAC
+if ( grepl("smonti.bumc.bu.edu",system("hostname",intern=TRUE)) || grepl("Mac",system("hostname",intern=TRUE)) ) {
+    PATH <- "~/research/projects/longevity/novartis"
+}
+source(file.path(PATH,"scripts/support.functions.R"))
+source(file.path(Sys.getenv("CBMRtools"),"CBMRtools/R/misc.R")) 
+```
+
+## Offspring _vs._ Control
+
+Here we test whether there's a difference between offspring and
+control in the slope of the gene-age relationship. The assumption is
+that the dependency of a gene expression on age might change between
+control and offspring.
+
+```{r }
+## see analysis01.somascan.Rmd for derivation of soma2
+soma2 <- readRDS(file.path(PATH,"workdir/somascan/soma2.RDS"))
+table(soma2$Cohort)
+
+## restrict to control+offspring
+soma3 <- soma2[,soma2$Cohort %in% c("Control","Offspring")]
+soma3$Cohort <- droplevels(soma3$Cohort)
+
+## "clean up" age (make it numeric)
+age <- soma3$Age.Blood
+age <- sapply( age, function(Z) as.numeric(gsub("+","",unlist(strsplit(as.character(Z),"-"))[1])) )
+soma3$age <- age
+
+## run a regression w/ cohort-age interaction effect and return the interaction effect term
+lmInt <-
+    as.data.frame(
+        t(sapply( 1:nrow(soma3),
+                 function(i) {
+                     tmp <- lm(exprs(soma3)[i,] ~ Cohort*age + Gender + Year.completed, data=pData(soma3))
+                     summary(tmp)$coefficients["CohortOffspring:age",c("Estimate","Pr(>|t|)")]
+                 }))
+    )
+## correct for MHT
+lmInt$fdr <- p.adjust(lmInt[,"Pr(>|t|)"],method="BH")
+colnames(lmInt) <- c("OffspringDeltaSlope","pvalue","qvalue")
+rownames(lmInt) <- featureNames(soma3)
+
+## show the most significant aptamers
+head(lmInt[order(lmInt[,2]),])
+ 
+## anything significant at FDR<=0.25?
+sum(lmInt$qvalue<=.25)
+```

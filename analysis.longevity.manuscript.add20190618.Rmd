@@ -1,0 +1,203 @@
+---
+title: "Analyses for Longevity Manuscript"
+author: "Stefano Monti"
+date: 6/18/2019
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    theme: united
+    toc: yes
+---
+
+```{r global, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE,fig.path='../results/manuscript/figures/')
+```
+
+```{r settings}
+require(pheatmap)
+require(openxlsx)
+require(Biobase)
+require(limma)
+require(cba)
+require(VennDiagram)
+
+## SCC 
+if ( grepl("scc",system("hostname",intern=TRUE)) ) {
+    ## NECS is /restricted/projectnb/necs/
+    PATH <- file.path( Sys.getenv("NECS"),"novartis-data/smonti")
+}
+## MAC
+if ( grepl("bumc.bu.edu",system("hostname",intern=TRUE)) || grepl("Mac",system("hostname",intern=TRUE)) ) {
+    ##require(hypeR)
+    PATH <- "~/research/projects/longevity/novartis"
+}
+source(file.path(PATH,"scripts/support.functions.R"))
+source(file.path(Sys.getenv("CBMRtools"),"CBMRtools/R/misc.R"))
+```
+
+## To-Do List
+
+1. Can we make a Venn diagram of 4 lists:
+
+	a. Aging signature
+
+	b. List of 50 markers linked to extreme old age signature
+
+	c. Longevity signature in offspring
+
+	d. Longevity signature in centenarians
+
+2. We analyzed offspring _vs control but nothing passed the
+   significance level after correction. What if we restrict the
+   analysis to the list of biomarkers on the longevity signature in
+   the offspring, or the combined offspring/centenarians longevity
+   signature? Do we see anything significant in this smaller set?
+ 
+3. Creae heatmap for the hallmark pathways in the offspring longevity
+   signature restricted to the following pathways:
+   ESTROGEN_RESPONSE_LATE, ANGIOGENESIS, MTORC1_SIGNALING,
+   TGF_BETA_SIGNALING, INFLAMMATORY_RESPONSE, DNA_REPAIR,
+   IL6_JAK_STAT3_SIGNALING, ALLOGRAFT_REJECTION, UV_RESPONSE_DN,
+   P53_PATHWAY, ANDROGEN_RESPONSE, WNT_BETA_CATENIN_SIGNALING
+ 
+
+```{r load.data}
+soma2 <- readRDS(file.path(PATH,"workdir/somascan/soma2.RDS"))
+```
+
+### 1. Four-signature Overlap
+
+```{r 4signature.overlap}
+## aging signature 
+lmRes <- readRDS(file=file.path(PATH,"workdir/somascan/lmRes.RDS"))
+## longevity signatures
+centRes2 <- readRDS(file=file.path(PATH,"workdir/manuscript/centRes2.RDS"))
+restRes2 <- readRDS(file=file.path(PATH,"workdir/manuscript/restRes2.RDS"))
+## curated signatures
+longevitySig <- readRDS(file=file.path(PATH,"gdrive/longevitySignatures.RDS"))
+
+sigList <- list(
+    aging=unique(lmRes[lmRes$fdr<=0.01,"geneID"]),
+    longevityCent=unique(centRes2[centRes2$p.value<=.01,"symbol"]),
+    longevityOffs=unique(restRes2[restRes2$p.value<=.01,"symbol"]),
+    longevityNECS=longevitySig$NECSunique)
+print(sapply(sigList,length))
+
+fill <- c("light blue", "pink","orange","yellow")
+size  <- rep(0.5,4)
+venn <- venn.diagram(x = sigList,
+                     filename = NULL,
+                     height = 1000,
+                     width = 2000, fill = fill,
+                     cat.default.pos = "text",
+                     cat.cex = size,
+                     main = "Overlap of Aging/Longevity signatures",
+                     hyper.test=TRUE,lower.tail=FALSE,total.population=length(unique(fData(soma2)$symbol)))
+#grid.newpage()
+grid.draw(venn)
+```
+
+### 2. Offspring vs. Control
+
+Even after restricting to top 'genes' (q<=0.25) from the offsprings'
+longevity signature, no genes pass significance when comparing
+offsprings to controls.
+
+```{r offspring.vs.control}
+## restrict to non-centenarians and to longevity signature proteins
+off2 <- soma2[rownames(restRes2)[restRes2$FDR<=0.25],soma2$Cohort!="Centenarian"]
+off2$Cohort <- droplevels(off2$Cohort)
+table(off2$Cohort)
+
+diffOff <- as.data.frame(
+    t(sapply( 1:nrow(off2),
+             function(i) {
+                 tmp <- lm(exprs(off2)[i,] ~ Cohort + Gender + Year.completed, data=pData(off2))
+                 summary(tmp)$coefficients["CohortOffspring",c("Estimate","Pr(>|t|)")]
+             }))
+)
+rownames(diffOff) <- featureNames(off2)
+diffOff <- cbind(geneID=fData(off2)$symbol,diffOff)
+diffOff <- diffOff[order(diffOff[,"Pr(>|t|)"]),]
+diffOff$fdr <- p.adjust(diffOff[,"Pr(>|t|)"], method="BH")
+
+print( rbind(analytes=c("fdr<=0.25"=sum(diffOff$fdr<=.05), "fdr<=0.05"=sum(diffOff$fdr<=.01)),
+             proteins=c("fdr<=0.25"=length(unique(diffOff$geneID[diffOff$fdr<=.05])),
+                 "fdr<=0.05"=length(unique(diffOff$geneID[diffOff$fdr<=.01])))) )
+```
+
+### 3. Offsprings Heatmap
+
+```{r offsprings.heatmap}
+pheatmapColors <- colGradient(c("darkgreen","white","darkorange"),length=11)
+
+gsets <- c("ESTROGEN_RESPONSE_LATE",
+           "ANGIOGENESIS",
+           "MTORC1_SIGNALING",
+           "TGF_BETA_SIGNALING",
+           "INFLAMMATORY_RESPONSE",
+           "DNA_REPAIR",
+           "IL6_JAK_STAT3_SIGNALING",
+           "ALLOGRAFT_REJECTION",
+           "UV_RESPONSE_DN",
+           "P53_PATHWAY",
+           "ANDROGEN_RESPONSE",
+           "WNT_BETA_CATENIN_SIGNALING")
+
+rest1 <- readRDS(file.path(PATH,"workdir/rest1.RDS"))
+table(rest1$age.group,rest1$FU.2group,useNA="ifany") 
+somaHall <- readRDS(file.path(PATH,"workdir/somascan/somaHall.RDS"))
+featureNames(somaHall) <- gsub("HALLMARK_","",featureNames(somaHall))
+somaHall <- somaHall[match(gsets,featureNames(somaHall)),sampleNames(rest1)]
+pData(somaHall) <- pData(rest1)
+somaHall <- somaHall[,order(somaHall$FU.2group)] 
+
+annot_col <- pData(somaHall)[,c("Cohort","age.group","FU.2group")]
+annotColors <- list(age.group=c("lightgray","darkgray"),
+                    FU.2group=c("lightblue","pink"),
+                    Cohort=c("yellow2","yellow3"),
+                    markers=c(up="darkred",down="darkgreen"))
+names(annotColors$age.group) <- levels(somaHall$age.group)
+names(annotColors$FU.2group) <- levels(somaHall$FU.2group)
+names(annotColors$Cohort) <- levels(somaHall$Cohort)
+
+gspfile <- paste0("workdir/manuscript/somaHall.rest2.longevity.gspDiffanal.RDS")
+gspDiff <- readRDS(file.path(PATH,gspfile))
+ 
+annot_row <-
+    data.frame(markers=c("down","up")[as.integer(gspDiff[gsets,"Estimate"]>0)+1])
+rownames(annot_row) <- gsets
+annotColors$markers <- c(down="darkgreen",up="darkred")
+
+hcRow <- hcopt(as.dist(1-cor(t(exprs(somaHall)),use="pairwise.complete.obs")),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(somaHall))),,method="ward.D")
+
+pheatmap(exprs(somaHall),main="samples ordered by phenotype, markers clustered",
+         color=pheatmapColors,
+         annotation_col = annot_col,
+         annotation_row = annot_row,
+         annotation_colors = annotColors,
+         cluster_rows=hcRow,
+         cluster_cols=FALSE, #hcCol,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         labels_row=gsub("HALLMARK_","",featureNames(somaHall)),
+         fontsize_row=9,
+         scale = "row",
+         cellheight=12)
+
+pheatmap.group(mat=somaHall,main="samples clustered within phenotype, markers clustered",
+               group="FU.2group",
+               color=pheatmapColors,
+               annotation_col = annot_col,
+               annotation_row = annot_row,
+               annotation_colors = annotColors,
+               cluster_rows=TRUE,
+               show_rownames = TRUE,
+               show_colnames = FALSE,
+               labels_row=gsub("HALLMARK_","",featureNames(somaHall)),
+               fontsize_row=9,
+               scale = "row",
+               cellheight=12)
+```
