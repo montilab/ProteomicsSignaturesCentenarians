@@ -1,0 +1,237 @@
+---
+title: "Somascan Data Analysis"
+author: "Stefano Monti, Paola Sebastiani, Anastasia Gurinovich"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    theme: united
+    toc: yes
+---
+
+```{r global, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE,fig.path='../results/somascan/figures/')
+```
+
+```{r settings}
+require(CBMRtools)
+require(limma)
+require(pheatmap)
+require(openxlsx)
+require(GSVA)
+library(Biobase)
+PATH <- "~/research/projects/longevity/novartis"
+source(file.path(PATH,"scripts/support.functions.R"))
+source(file.path(Sys.getenv("CBMRtools"),"dvlp/diffanalOverlap.R"))
+```
+
+## Read and Process Somascan Data
+
+Notice that there are multiple protein IDs mapping to the same gene
+symbol. These will all be included in the analysis.
+
+## QC analysis
+
+We generate some exploratory plots to look at data distribution and possible outliers.
+
+```{r qc.analysis}
+soma <- readRDS(file.path(PATH,"data/somascan/180308_CentCollabBU_HybNormPlateScaleMedNormCal.eset.RDS"))
+table(pData(soma)$Cohort)
+```
+
+We first look at the relationship between location (median) and scale
+(median absolute deviation) of the log2-transformed data, which
+confirms the suitability of an additive (linear) model.
+
+```{r qc.mva}
+## distribution of raw data
+hist(exprs(soma))
+
+## first, show the relationship btw location and scale
+somaL <- soma; exprs(somaL) <- log2(exprs(soma))
+hist(exprs(somaL))
+loc <- apply(exprs(somaL),1,median)
+scl <- apply(exprs(somaL),1,mad)
+plot(loc,scl,log="",xlab="location (median)",ylab="scale (mad)")
+```
+
+Boxplots of within-sample distributions (in log2 space) confirm the
+appropriateness of a log-normal model.
+
+```{r qc.boxplots}
+## then, show the within-sample distribution
+cohortPalette <- c("pink","darkred","red","whitesmoke","lightgray")
+names(cohortPalette) <- levels(pData(soma)[,"Cohort"])
+cohortCol <- cohortPalette[pData(soma)[,"Cohort"]]
+names(cohortCol) <- sampleNames(soma)
+
+ord <- order(pData(somaL)$Cohort)
+boxplot(exprs(somaL)[,ord],las=2,pch="-",col=cohortCol[ord],show.names=FALSE)
+legend("bottomleft",col=cohortPalette,legend=names(cohortPalette),pch=15,cex=.75)
+```
+
+A first look at the heatmap of _all_ data shows the dominance of very
+extreme values, which justifies the filtering we perform below.
+
+```{r pheatmap}
+## color gradient for the expression levels (blue=down-regulated; white=neutral; red=up-regulated)
+bwrPalette <- colGradient(c("blue","white","red"),length=9)
+
+## sample color coding
+annot <- pData(soma)[, c("Cohort", "Health.Dementia", "Health.Stroke","Health.Heart.Attack")]
+colnames(annot) <- c("group", "dementia", "stroke", "heart")
+
+annotCol <- list(
+    group = cohortPalette,
+    dementia = c(No="white",Yes="red"),
+    stroke = c(No="white",Yes="red"),
+    heart = c(No="white",Yes="red")
+)
+saveRDS( list(annot=annot,annotCol=annotCol), file=file.path(PATH,"workdir/somascan/pheatmap.annot.RDS") )
+hcCol <- hcopt(dist(t(exprs(somaL))),method="ward.D")
+hcRow <- hcopt(as.dist(1-cor(t(exprs(somaL)))),method="ward.D")
+pheatmap(exprs(somaL),
+         color=bwrPalette,
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+```
+
+(NOTE: for clustering, we used the wrapper `hcopt` (defined in
+CBMRtools), which adds an <a
+href="https://academic.oup.com/bioinformatics/article-lookup/doi/10.1093/bioinformatics/btg030">optimal
+leaf-ordering</a> to the standard `hclust` procedure).
+
+## PCA projection
+
+The PCA projection identifies 2 outliers (mostly evident in the 1st
+component), which we will eliminate from subsequent analyses.
+
+```{r pca}
+pca <- prcomp(exprs(somaL), scale = TRUE) ## perform PCA
+summary(pca)$importance[,1:4]             ## show variance explained by each component
+
+## let's plot the first two components
+if ( any(rownames(pca$rotation)!=names(cohortCol)) ) stop( "rownames(pca$rotation)!=names(cohortCol)" )
+plot(x=pca$rotation[,"PC1"],y=pca$rotation[,"PC2"],col=cohortCol,main="PCA",xlab="1st PC", ylab="2nd PC",pch=20)
+legend("bottomleft",col=cohortPalette,legend=names(cohortPalette),pch=20)
+
+outliers <- which(pca$rotation[,"PC1"]<.060)
+text(x=pca$rotation[outliers,"PC1"],y=pca$rotation[outliers,"PC2"],pos=4,
+     labels=gsub("S-161024-","",rownames(pca$rotation)[outliers]))
+
+## let's plot the first and third component
+plot(x=pca$rotation[,"PC1"],y=pca$rotation[,"PC3"],col=cohortCol,main="PCA",xlab="1st PC", ylab="3rd PC",pch=20)
+legend("topright",col=cohortPalette,legend=names(cohortPalette),pch=20)
+text(x=pca$rotation[outliers,"PC1"],y=pca$rotation[outliers,"PC3"],pos=4,
+     labels=gsub("S-161024-","",rownames(pca$rotation)[outliers]))
+
+## let's plot the second and third component
+plot(x=pca$rotation[,"PC2"],y=pca$rotation[,"PC3"],col=cohortCol,main="PCA",xlab="2nd PC", ylab="3rd PC",pch=20)
+legend("topleft",col=cohortPalette,legend=names(cohortPalette),pch=20)
+text(x=pca$rotation[outliers,"PC2"],y=pca$rotation[outliers,"PC3"],pos=4,
+     labels=gsub("S-161024-","",rownames(pca$rotation)[outliers]))
+
+ord <- order(pData(somaL)$Cohort)
+outlier.names <- sampleNames(soma); outlier.names[-outliers] <- ""
+outlier.border <- rep("gray",ncol(soma)); outlier.border[outliers] <- "black"
+par(mar=c(7, 4, 4, 2))
+boxplot(exprs(somaL)[,ord],las=2,pch="-",col=cohortCol[ord],names=outlier.names[ord],
+        border=outlier.border[ord],cex.axis=.75)
+legend("bottomleft",col=cohortPalette,legend=names(cohortPalette),pch=15,cex=.7)
+
+remove <- sampleNames(soma)[order(pca$rotation[,"PC1"])[1:2]]
+soma0 <- somaL[,-match(remove,sampleNames(somaL))]
+print(remove)
+
+## add APOE and gen.type
+
+ann <- read.csv(file=file.path(PATH,"data/nastia/data.ss.apoe.csv"))
+ann <- data.frame(ann[,c("key.SubjID","APOE","gen.type")],row.names=1)
+pdata <- pData(soma0)
+
+pdata <- cbind(pdata,ann[match.nona(rownames(pdata),rownames(ann)),])
+APOE3 <- pdata$APOE; APOE3[is.na(APOE3)] <- "e3e4"
+pdata$APOE3 <- factor(
+    sapply( APOE3, function(Z) if (Z=="e2e3" || Z=="e2e2") "e2" else if (Z=="e3e3") "e3" else if (Z=="e3e4") "e4" else NA),
+    levels=c("e2","e3","e4"))
+pData(soma0) <- pdata
+saveRDS(soma0,file=file.path(PATH,"workdir/somascan/soma0.RDS"))
+##soma0 <- readRDS(file.path(PATH,"workdir/somascan/soma0.RDS"))
+```
+
+## Analyte Outlier Filtering
+
+Based on the heatmap shown above, and the dominance of very extreme
+values, we cap values at +/- 3sd from the (trimmed) mean.
+
+```{r outlier.filtering}
+soma1 <- soma0
+MN <- apply(exprs(soma1),1,mean,trim=0.025)
+SD <- apply(exprs(soma1),1,sd)
+exprs(soma1)[exprs(soma1) > MN + 3*SD | exprs(soma1) < MN -3*SD] <- NA
+saveRDS(soma1,file.path(PATH,"workdir/somascan/soma1.RDS"))
+##soma1 <- readRDS(file.path(PATH,"workdir/somascan/soma1.RDS"))
+
+## let us plot the heatmap again, this time w/ the thresholded values
+## ..(and the two outliers removed)
+
+annot1 <- annot[sampleNames(soma1),]
+hcRow <- hcopt(as.dist(1-cor(t(exprs(soma1)),use="pairwise.complete.obs")),method="ward.D")
+hcCol <- hcopt(dist(t(exprs(soma1))),method="ward.D")
+pheatmap(exprs(soma1),
+         color=colGradient(c("blue","white","red"),length=15),
+         annotation_col = annot1,
+         annotation_colors = annotCol,
+         cluster_rows=hcRow,
+         cluster_cols=hcCol,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+```
+
+## Phenotype Grouping
+
+Next, we collapse some of the groups, so as to have a 3-group phenotype: control, offspring, and centenarians.
+
+```{r diffanal.prep}
+soma2 <- soma1
+cohort <- as.character(pData(soma2)$Cohort)
+cohort[grep("Control",cohort)] <- "Control"
+cohort <- gsub("Centenarian Offspring","Offspring",cohort)
+cohort <- gsub("Centenarian Singleton","Centenarian",cohort)
+cohort <- gsub("Centenarian Sib-Pair","Centenarian",cohort)
+pData(soma2)$Cohort <- factor(cohort,levels=c("Control","Offspring","Centenarian"))
+saveRDS(soma2,file.path(PATH,"workdir/somascan/soma2.RDS"))
+##soma2 <- readRDS(file.path(PATH,"workdir/somascan/soma2.RDS"))
+```
+
+```{r longevity.grouping, eval=FALSE, echo=FALSE}
+## obsolete, but keeping it in (invisible)
+## centenarians grouping
+cent <- soma2[,soma2$Cohort=="Centenarian"]
+cent$FU <- cent$Age-cent$Age.serum; cent$FU[cent$FU<0] <- 0
+cent$age.group <- cut(cent$Age.serum,breaks=c(100,105,110,200),right=FALSE,incluse.lowest=TRUE)
+cent$FU.2group <- cut(cent$FU,breaks=c(0,2,Inf),labels=c("short","long"),right=FALSE,include.lowest=TRUE)
+table(cent$age.group,cent$FU.2group,useNA="ifany")
+
+## offsprings (+control) grouping
+rest <- soma2[,soma2$Cohort!="Centenarian"]
+rest$FU <- rest$Age-rest$Age.serum; rest$FU[rest$FU<0] <- 0
+rest$age.group <- cut(rest$Age.serum,breaks=c(45,71,100),right=FALSE,incluse.lowest=TRUE)
+rest$FU.2group <- cut(rest$FU,breaks=c(0,11,Inf),labels=c("short","long"),right=FALSE,include.lowest=TRUE)
+#rest$FU.2group[rest$FU.2group=="[0,11)" & rest$Deceased=="No"] <- NA
+table(rest$age.group,rest$FU.2group,useNA="ifany")
+
+soma2$FU.2group <- rep("",ncol(soma2))
+pData(soma2)[sampleNames(cent),"FU.2group"] <- as.character(cent$FU.2group)
+pData(soma2)[sampleNames(rest),"FU.2group"] <- as.character(rest$FU.2group)
+soma2$FU.2group <- factor(soma2$FU.2group,levels=c("short","long") )
+saveRDS(soma2,file.path(PATH,"workdir/somascan/soma2.RDS"))
+##soma2 <- readRDS(file.path(PATH,"workdir/somascan/soma2.RDS"))
+```
+
